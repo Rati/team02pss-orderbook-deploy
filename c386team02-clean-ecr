@@ -1,0 +1,99 @@
+pipeline {
+  agent {
+    kubernetes {
+        yaml """\
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      labels:
+        builder: promotion
+    spec:
+      serviceAccountName: jenkins-agent
+      containers:
+      - name: awscli
+        image: amazon/aws-cli
+        command:
+        - cat
+        tty: true
+    """.stripIndent()
+    }
+  }
+    parameters {
+    string(name: 'CourseName', description: 'Specify the cXXX part of the course to delete images for',defaultValue:'c386team02')
+    choice(name: 'ecrname', choices: ['production-support-course', 'sre-course'], description: 'Specify the registry to delete images from')
+    string(name: 'revisionHistory', description: 'Specify the Number of latest revisions to keep.',defaultValue:'3')
+    }
+
+
+  stages {
+    stage('Delete Image') {
+      steps {
+          container(name: 'awscli') {
+            script {
+              revisionsToKeep=Integer.valueOf(revisionHistory)
+              imageTypes = ['api', 'db', 'fe', 'currency-api']
+              envTypes = ['uat', 'dev', 'prod']
+              preserved_images = []
+              for (imageType in imageTypes){
+                for (env in envTypes){
+                  latest_image=get_latest_image(ecrname,CourseName+imageType+"-"+env)
+                  images_to_preserve = get_images_to_preserve(latest_image,revisionsToKeep,CourseName+imageType+"-"+env)
+                  preserved_images+=images_to_preserve
+                }
+              }
+              //print preserved_images
+              delete_images(revisionsToKeep,preserved_images,ecrname)
+                
+            }
+        }
+      }
+    }
+  }
+  environment {
+    ECR_REPO = '108174090253.dkr.ecr.us-east-1.amazonaws.com/${ecrname}'
+    AWS_DEFAULT_REGION='us-east-1'
+  }
+}
+
+def delete_images(revisionsToKeep,images_to_preserve,ecrname){
+  imagesToDelete = sh(script: "aws ecr list-images --repository-name \${ecrname} | grep ${CourseName} | tr -d '\n' | tr -d '[:space:]' | tr -d ',' | sed 's/\"\"/,/g' | sed 's/\"//g'",returnStdout: true).trim().replaceAll("imageTag:","imageTag=").split(',') as List
+  imagesToDeleteAfterFilter = imagesToDelete - images_to_preserve
+  if(imagesToDeleteAfterFilter.size() > 0){
+    imagesToDeleteAfterFilter = imagesToDeleteAfterFilter.take(100);
+    delete_ecr_images(ecrname, imagesToDeleteAfterFilter)
+    delete_images(revisionsToKeep,images_to_preserve,ecrname)
+  }
+}
+
+def get_images_to_preserve(latest_image,revisionsToKeep,imagePattern){
+  image_tags_to_preserve=[]
+  being_image=0
+  if(latest_image >revisionsToKeep){
+    begin_image=latest_image-revisionsToKeep;
+  }
+  for(int i = begin_image; i <= latest_image+2; i++){
+      image_tags_to_preserve.add('imageTag='+imagePattern+"-"+i)
+  }
+ // print image_tags_to_preserve
+  return image_tags_to_preserve
+}
+
+
+def delete_ecr_images(ecrname, imagesToDelete) {
+  if(imagesToDelete.size() > 0){
+    imageInput = imagesToDelete.join(" ")
+    sh "aws ecr batch-delete-image --repository-name \${ecrname} --image-ids ${imageInput}"
+  }
+}
+
+def get_latest_image(ecrname,imageType){
+  latest_version = sh(script: "aws ecr describe-images --repository-name \${ecrname} --query 'reverse(sort_by(imageDetails, &imagePushedAt)).[[?imageTags[?contains(@,`${imageType}`)]].[imagePushedAt,imageDigest,imageTags][0]]'",returnStdout: true).trim()
+  latest_version_clean= latest_version.substring(latest_version.lastIndexOf('-') + 1).replaceAll("\"", "").replaceAll("]", "").replaceAll("null", "").replaceAll("\\[", "").trim();
+  //print latest_version_clean
+  if (latest_version_clean != ""){
+    return Integer.valueOf(latest_version_clean)
+  }
+  else{
+    return 0
+  }
+}

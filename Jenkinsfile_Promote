@@ -1,0 +1,128 @@
+pipeline {
+  agent {
+    kubernetes {
+        yaml """\
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      labels:
+        builder: promotion
+    spec:
+      serviceAccountName: jenkins-agent
+      containers:
+      - name: awscli
+        image: amazon/aws-cli
+        command:
+        - cat
+        tty: true
+    """.stripIndent()
+    }
+  }
+  stages {
+
+    stage('Function Test before promote'){
+      steps{
+        script {
+              sh """
+               curl https://c386team02dev.computerlab.online/
+                curl https://c386team02dev-api.computerlab.online/
+               """
+        }
+      }
+    }
+
+    stage('Promote to Production') {
+      steps {
+          container(name: 'awscli') {
+            script {
+              apiBuildNumber=get_latest_image(imageAPIUATName)
+              dbBuildNumber=get_latest_image(imageDBUATName)
+              feBuildNumber=get_latest_image(imageFEUATName)
+            }
+            sh '''
+            export AWS_DEFAULT_REGION=us-east-1
+            apiBuildNumber=''' + apiBuildNumber + '''
+            dbBuildNumber=''' + dbBuildNumber + '''
+            feBuildNumber=''' + feBuildNumber + '''
+            APIMANIFEST=$(aws ecr batch-get-image --repository-name production-support-course --image-ids imageTag=${imageAPIUATName}${apiBuildNumber} --query 'images[].imageManifest' --output text)
+            DBMANIFEST=$(aws ecr batch-get-image --repository-name production-support-course --image-ids imageTag=${imageDBUATName}${dbBuildNumber} --query 'images[].imageManifest' --output text)
+            FEMANIFEST=$(aws ecr batch-get-image --repository-name production-support-course --image-ids imageTag=${imageFEUATName}${feBuildNumber} --query 'images[].imageManifest' --output text)
+            # Check API
+            if [ $(aws ecr describe-images --repository-name production-support-course | grep "${imageAPIProdName}${apiBuildNumber}" | wc -l) -eq 0 ]
+            then
+              # We don't have prod so tag Dev to prod
+              if ! aws ecr put-image --repository-name production-support-course --image-tag ${imageAPIProdName}${apiBuildNumber} --image-manifest "$APIMANIFEST"
+              then
+                exitvalue=1
+              fi
+            fi
+            # Check DB
+            if [ $(aws ecr describe-images --repository-name production-support-course | grep "${imageDBProdName}${dbBuildNumber}" | wc -l) -eq 0 ]
+            then
+              # We don't have prod so tag Dev to prod
+              if ! aws ecr put-image --repository-name production-support-course --image-tag ${imageDBProdName}${dbBuildNumber} --image-manifest "$DBMANIFEST"
+              then
+                exitvalue="${exitvalue}2"
+              fi
+            fi
+            
+            # Check Front End
+            if [ $(aws ecr describe-images --repository-name production-support-course | grep "${imageFEProdName}${feBuildNumber}" | wc -l) -eq 0 ]
+            then
+              # We don't have prod so tag Dev to prod
+              if ! aws ecr put-image --repository-name production-support-course --image-tag ${imageFEProdName}${feBuildNumber} --image-manifest "$FEMANIFEST"
+              then
+                exitvalue=3
+              fi
+            fi
+
+          case ${exitvalue} in
+            0) echo "Update OK"
+               ;;
+            1) echo "API failed to push to repository"
+               ;;
+            2) echo "DB failed to push to repository"
+               ;;
+            3) echo "AC failed to push to repository"
+               ;;
+            12) echo "API and DB failed to push to repository"
+               ;;
+            13) echo "API and AC failed to push to repository"
+               ;;
+            23) echo "DB and AC failed to push to repository"
+               ;;
+            123) echo "All images failed to push to repository"
+               ;;
+          esac
+
+          exit ${exitvalue}
+'''
+        }
+      }
+    }
+  }
+  environment {
+    ECR_REPO = '108174090253.dkr.ecr.us-east-1.amazonaws.com/production-support-course'
+
+    imageAPIUATName='c386team02api-uat-'
+    imageAPIProdName='c386team02api-prod-'
+    imageDBUATName='c386team02db-uat-'
+    imageDBProdName='c386team02db-prod-'
+    imageFEUATName='c386team02fe-uat-'
+    imageFEProdName='c386team02fe-prod-'
+    projectName='c386team02'
+
+  }
+}
+
+def get_latest_image(imageType){
+  latest_version = sh(script: "aws ecr describe-images --repository-name production-support-course --query 'reverse(sort_by(imageDetails, &imagePushedAt)).[[?imageTags[?contains(@,`${imageType}`)]].[imagePushedAt,imageDigest,imageTags][0]]'",returnStdout: true).trim()
+  latest_version_clean= latest_version.substring(latest_version.lastIndexOf('-') + 1).replaceAll("\"", "").replaceAll("]", "").replaceAll("null", "").replaceAll("\\[", "").trim();
+  print latest_version_clean
+  if (latest_version_clean != ""){
+    return Integer.valueOf(latest_version_clean)
+  }
+  else{
+    return 0
+  }
+}
